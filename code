@@ -1,0 +1,1598 @@
+#include <xc.h>       // Main XC8 header for PIC microcontrollers
+#include <stdint.h>   // Standard integer types like uint8_t, uint16_t, uint32_t
+
+// Define oscillator frequency used by __delay_ms() and __delay_us()
+#define _XTAL_FREQ  20000000UL
+
+// ===================== CONFIGURATION BITS =====================
+// These settings configure the PIC hardware behavior before the program starts.
+#pragma config FOSC  = HS     // High-speed crystal oscillator
+#pragma config WDTE  = OFF    // Watchdog Timer disabled
+#pragma config PWRTE = ON     // Power-up Timer enabled
+#pragma config BOREN = ON     // Brown-out Reset enabled
+#pragma config LVP   = OFF    // Low-voltage programming disabled
+#pragma config CPD   = OFF    // Data EEPROM code protection disabled
+#pragma config WRT   = OFF    // Flash program memory write protection disabled
+#pragma config CP    = OFF    // Code protection disabled
+
+// ===================== INPUT MASKS =====================
+// These masks are used to read buttons and gas sensor from PORTA.
+#define BTN_START_MASK  0x01   // RA0: Start button
+#define BTN_PAUSE_MASK  0x02   // RA1: Pause button
+#define GAS_MASK        0x08   // RA3: Gas sensor input
+#define BTN_RESET_MASK  0x10   // RA4: Reset button
+#define BTN_MODE_MASK   0x20   // RA5: Mode button
+
+// ===================== DHT22 PIN =====================
+// DHT22 data pin is connected to RA2.
+#define DHT_PIN  PORTAbits.RA2
+#define DHT_DIR  TRISAbits.TRISA2
+
+// ===================== LCD PINS =====================
+// LCD is used in 4-bit mode on PORTC.
+#define LCD_RS  PORTCbits.RC0
+#define LCD_EN  PORTCbits.RC1
+#define LCD_D4  PORTCbits.RC2
+#define LCD_D5  PORTCbits.RC3
+#define LCD_D6  PORTCbits.RC4
+#define LCD_D7  PORTCbits.RC5
+
+// ===================== STATUS LEDS =====================
+// Three status LEDs connected to PORTE.
+#define LED_GREEN   PORTEbits.RE0
+#define LED_YELLOW  PORTEbits.RE1
+#define LED_RED     PORTEbits.RE2
+
+// ===================== BARGRAPH =====================
+// First two bargraph LEDs are on RC6 and RC7.
+// Remaining LEDs are controlled by PORTD.
+#define BAR_SEG0    PORTCbits.RC6
+#define BAR_SEG1    PORTCbits.RC7
+
+// ===================== TIMING CONSTANTS =====================
+// These constants control delays, refresh times, debounce, and long press timing.
+#define RESET_HOLD_MS         3000UL
+#define DHT_REFRESH_MS        2500UL
+#define DEBOUNCE_MS             40UL
+#define LONGPRESS_LOCK_MS     1200UL
+#define LONGPRESS_SCREEN_MS   2000UL
+#define LCD_REFRESH_MS         200UL
+#define FLASH_MSG_MS_SHORT     500UL
+#define FLASH_MSG_MS_MEDIUM    700UL
+#define FLASH_MSG_MS_LONG      900UL
+
+// ===================== SYSTEM STATES =====================
+// Main operating states of the smart oven.
+typedef enum {
+    ST_SETTING = 0,     // User enters time
+    ST_RUNNING,         // Timer is counting down
+    ST_PAUSED,          // Timer is paused
+    ST_FINISHED,        // Timer finished
+    ST_EMERGENCY        // Gas emergency detected
+} state_t;
+
+// ===================== LCD SCREENS =====================
+// Different display pages shown on the LCD.
+typedef enum {
+    SCR_MAIN = 0,       // Time and state screen
+    SCR_TEMP,           // Temperature and humidity screen
+    SCR_SAFETY,         // Gas and alarm screen
+    SCR_SYSTEM,         // Lock and system status screen
+    SCR_COUNT           // Number of screens
+} screen_t;
+
+// ===================== BUTTON STRUCTURE =====================
+// Stores button debounce and edge detection information.
+typedef struct {
+    uint8_t  stable;        // Stable debounced value
+    uint8_t  last_raw;      // Last raw reading
+    uint32_t last_change;   // Time when raw value changed
+    uint8_t  fired;         // Prevents repeated triggering while held
+} btn_t;
+
+// ===================== KEYPAD STATE MACHINE =====================
+// Used to detect normal key presses and long presses.
+typedef enum {
+    KSM_IDLE = 0,       // No key pressed
+    KSM_DEBOUNCE,       // Waiting for stable key press
+    KSM_HELD,           // Key is being held
+    KSM_RELEASE_WAIT    // Long press detected, wait for release
+} ksm_t;
+
+// ===================== GLOBAL TIMER VARIABLES =====================
+// Updated by Timer0 interrupt.
+static volatile uint16_t g_subsec = 0;
+static volatile uint32_t g_now_ms = 0;
+
+// ===================== GLOBAL SYSTEM VARIABLES =====================
+static volatile state_t  g_state  = ST_SETTING;  // Current oven state
+static screen_t g_screen = SCR_MAIN;             // Current LCD screen
+static volatile uint16_t g_remain = 0;           // Remaining time in seconds
+static uint16_t g_total = 0;                     // Total entered time in seconds
+static uint8_t g_lock = 0;                       // Child lock flag
+
+// ===================== TIME ENTRY VARIABLES =====================
+// Used to enter MMSS time from keypad.
+static uint8_t g_mm = 0;
+static uint8_t g_ss = 0;
+static uint8_t g_entry_pos = 0;
+
+// ===================== DHT22 VARIABLES =====================
+static uint8_t  g_temp = 0;       // Temperature value
+static uint8_t  g_hum  = 0;       // Humidity value
+static uint8_t  g_dht_ok = 0;     // DHT reading status
+static uint32_t g_dht_last = 0;   // Last DHT read time
+
+// ===================== EVENT TIMESTAMPS =====================
+static uint32_t g_finish_ts = 0;  // Time when countdown finished
+static uint32_t g_emerg_ts = 0;   // Time when emergency started
+
+// ===================== RESET HOLD VARIABLES =====================
+// Used during emergency reset hold.
+static uint32_t g_reset_hold_start = 0;
+static uint8_t  g_reset_holding = 0;
+
+// ===================== BUZZER FLAG =====================
+static volatile uint8_t g_buzz = 0;
+
+// ===================== BUTTON OBJECTS =====================
+// Initial stable state is 1 because buttons are active-low.
+static btn_t g_b_start = {1, 1, 0, 0};
+static btn_t g_b_pause = {1, 1, 0, 0};
+static btn_t g_b_reset = {1, 1, 0, 0};
+static btn_t g_b_mode  = {1, 1, 0, 0};
+
+// ===================== KEYPAD VARIABLES =====================
+static ksm_t g_ksm = KSM_IDLE;
+static uint32_t g_ksm_start_ms = 0;
+static uint8_t g_ksm_row = 0;
+static uint8_t g_ksm_col = 0;
+static char g_pending_key = 0;
+static uint8_t g_pending_long = 0;
+
+// Flash message end time
+static uint32_t g_flash_until = 0;
+
+// Keypad layout: 4 rows x 3 columns
+static const char keymap[4][3] = {
+    {'1','2','3'},
+    {'4','5','6'},
+    {'7','8','9'},
+    {'*','0','#'}
+};
+
+// ===================== FUNCTION PROTOTYPES =====================
+static void lcd_init(void);
+static void lcd_print(const char *s);
+static void lcd_goto(uint8_t row, uint8_t col);
+static void lcd_clear(void);
+static void render_screen(void);
+static uint8_t flash_active(void);
+static void flash_show(const char *l1, const char *l2, uint16_t ms);
+
+// ===================== PORTB WRITE =====================
+// Writes keypad row values and buzzer bit together to PORTB.
+static inline void portb_write(uint8_t rows_nibble)
+{
+    uint8_t v = 0x70;   // Keep keypad column inputs high
+
+    if (g_buzz)
+    {
+        v |= 0x80;      // Set RB7 if buzzer should be ON
+    }
+
+    v |= (rows_nibble & 0x0F);  // Keep only lower 4 bits for keypad rows
+    PORTB = v;
+}
+
+// Set all keypad rows idle high
+static inline void rows_idle_high(void)
+{
+    portb_write(0x0F);
+}
+
+// Turn buzzer ON or OFF
+static inline void buzzer(uint8_t on)
+{
+    g_buzz = on ? 1 : 0;
+    rows_idle_high();
+}
+
+/* 20MHz:
+   Fosc/4 = 5MHz
+   Timer tick with prescaler 1:32 = 6.4us
+   156 counts = 998.4us
+   Reload = 256 - 156 = 100
+*/
+// ===================== TIMER0 INITIALIZATION =====================
+// Timer0 generates approximately 1 ms tick.
+static void timer0_init(void)
+{
+    OPTION_REG = 0x04;      // Timer0 prescaler 1:32
+    TMR0 = 100;             // Preload Timer0 for about 1 ms overflow
+
+    INTCONbits.T0IF = 0;    // Clear Timer0 interrupt flag
+    INTCONbits.T0IE = 1;    // Enable Timer0 interrupt
+    INTCONbits.GIE  = 1;    // Enable global interrupts
+}
+
+// ===================== INTERRUPT SERVICE ROUTINE =====================
+// Runs every Timer0 overflow and updates system time.
+void __interrupt() isr(void)
+{
+    if (INTCONbits.T0IF)
+    {
+        INTCONbits.T0IF = 0;    // Clear interrupt flag
+        TMR0 = 100;             // Reload Timer0
+
+        g_now_ms++;             // Global millisecond counter
+        g_subsec++;             // Counts milliseconds for 1 second
+
+        if (g_subsec >= 1000)
+        {
+            g_subsec = 0;
+
+            // Decrease remaining time only while running
+            if (g_state == ST_RUNNING && g_remain > 0)
+            {
+                g_remain--;
+
+                // When timer reaches zero, go to finished state
+                if (g_remain == 0)
+                {
+                    g_state = ST_FINISHED;
+                    g_finish_ts = g_now_ms;
+                }
+            }
+        }
+    }
+}
+
+// Safely read current milliseconds because it is modified inside interrupt
+static uint32_t now_ms(void)
+{
+    uint32_t v;
+
+    INTCONbits.GIE = 0;
+    v = g_now_ms;
+    INTCONbits.GIE = 1;
+
+    return v;
+}
+
+// Safely read remaining seconds because it is modified inside interrupt
+static uint16_t remain_sec(void)
+{
+    uint16_t v;
+
+    INTCONbits.GIE = 0;
+    v = g_remain;
+    INTCONbits.GIE = 1;
+
+    return v;
+}
+
+// ===================== LCD FUNCTIONS =====================
+
+// Generate LCD enable pulse
+static void lcd_pulse(void)
+{
+    LCD_EN = 1;
+    __delay_us(5);
+
+    LCD_EN = 0;
+    __delay_us(80);
+}
+
+// Send 4 bits to LCD data pins
+static void lcd_send4(uint8_t nib)
+{
+    LCD_D4 = (nib >> 0) & 1;
+    LCD_D5 = (nib >> 1) & 1;
+    LCD_D6 = (nib >> 2) & 1;
+    LCD_D7 = (nib >> 3) & 1;
+
+    lcd_pulse();
+}
+
+// Send command byte to LCD
+static void lcd_cmd(uint8_t c)
+{
+    LCD_RS = 0;
+
+    lcd_send4(c >> 4);
+    lcd_send4(c & 0x0F);
+
+    __delay_ms(2);
+}
+
+// Send data character to LCD
+static void lcd_data(uint8_t d)
+{
+    LCD_RS = 1;
+
+    lcd_send4(d >> 4);
+    lcd_send4(d & 0x0F);
+
+    __delay_us(60);
+}
+
+// Clear LCD screen
+static void lcd_clear(void)
+{
+    lcd_cmd(0x01);
+    __delay_ms(2);
+}
+
+// Move LCD cursor to selected row and column
+static void lcd_goto(uint8_t row, uint8_t col)
+{
+    uint8_t addr;
+
+    if (row == 0)
+    {
+        addr = 0x80;
+    }
+    else
+    {
+        addr = 0xC0;
+    }
+
+    lcd_cmd(addr + col);
+}
+
+// Print string on LCD
+static void lcd_print(const char *s)
+{
+    while (*s)
+    {
+        lcd_data((uint8_t)*s++);
+    }
+}
+
+// Print unsigned 8-bit number as two digits
+static void lcd_print_u8_2d(uint8_t v)
+{
+    lcd_data((v / 10) + '0');
+    lcd_data((v % 10) + '0');
+}
+
+// Initialize LCD in 4-bit mode
+static void lcd_init(void)
+{
+    LCD_RS = 0;
+    LCD_EN = 0;
+
+    __delay_ms(40);
+
+    lcd_send4(0x03);
+    __delay_ms(5);
+
+    lcd_send4(0x03);
+    __delay_us(150);
+
+    lcd_send4(0x03);
+    __delay_us(150);
+
+    lcd_send4(0x02);
+
+    lcd_cmd(0x28);  // 4-bit mode, 2 lines
+    lcd_cmd(0x0C);  // Display ON, cursor OFF
+    lcd_cmd(0x06);  // Auto increment cursor
+    lcd_clear();
+}
+
+/* ===================== DHT22 DRIVER ===================== */
+
+// Wait until DHT pin becomes required level or timeout happens
+static uint8_t dht_wait_level(uint8_t level, uint16_t timeout_us)
+{
+    while (timeout_us--)
+    {
+        if (DHT_PIN == level)
+        {
+            return 1;
+        }
+
+        __delay_us(1);
+    }
+
+    return 0;
+}
+
+// Read temperature and humidity from DHT22 sensor
+static uint8_t dht22_read(void)
+{
+    uint8_t data[5] = {0, 0, 0, 0, 0};
+    uint8_t i;
+    uint8_t b;
+    uint8_t gie_save = INTCONbits.GIE;   // Save interrupt state
+
+    INTCONbits.GIE = 0;                  // Disable interrupts during strict DHT timing
+
+    DHT_DIR = 0;                         // Set DHT pin as output
+    DHT_PIN = 0;                         // Send start signal LOW
+    __delay_ms(25);
+
+    DHT_DIR = 1;                         // Release line and wait for sensor response
+    __delay_us(40);
+
+    // DHT22 response sequence
+    if (!dht_wait_level(0, 1000)) goto fail;
+    if (!dht_wait_level(1, 1000)) goto fail;
+    if (!dht_wait_level(0, 1000)) goto fail;
+
+    // Read 40 bits = 5 bytes
+    for (i = 0; i < 5; i++)
+    {
+        for (b = 0; b < 8; b++)
+        {
+            if (!dht_wait_level(1, 1000)) goto fail;
+
+            __delay_us(50);
+
+            data[i] <<= 1;
+
+            // If line is still high after 50 us, bit is 1
+            if (DHT_PIN)
+            {
+                data[i] |= 1;
+
+                if (!dht_wait_level(0, 1000)) goto fail;
+            }
+        }
+    }
+
+    // Checksum verification
+    if ((uint8_t)(data[0] + data[1] + data[2] + data[3]) != data[4])
+    {
+        goto fail;
+    }
+
+    {
+        uint16_t rh_raw;
+        uint16_t t_raw;
+
+        // Convert received bytes into raw humidity and temperature values
+        rh_raw = ((uint16_t)data[0] << 8) | data[1];
+        t_raw  = ((uint16_t)(data[2] & 0x7F) << 8) | data[3];
+
+        // DHT22 gives values multiplied by 10
+        g_hum  = (uint8_t)(rh_raw / 10);
+        g_temp = (uint8_t)(t_raw  / 10);
+    }
+
+    g_dht_ok = 1;
+
+    DHT_DIR = 1;
+    INTCONbits.GIE = gie_save;
+
+    return 1;
+
+fail:
+    // If reading fails, mark DHT data as invalid
+    g_dht_ok = 0;
+
+    DHT_DIR = 1;
+    INTCONbits.GIE = gie_save;
+
+    return 0;
+}
+
+// Try reading DHT22 three times before giving up
+static uint8_t dht22_read_retry(void)
+{
+    uint8_t i;
+
+    for (i = 0; i < 3; i++)
+    {
+        if (dht22_read())
+        {
+            return 1;
+        }
+
+        __delay_ms(50);
+    }
+
+    return 0;
+}
+
+/* ===================== BUTTONS ===================== */
+
+// Debounce button and detect one press event
+static uint8_t btn_edge(btn_t *b, uint8_t raw)
+{
+    uint32_t t = now_ms();
+
+    if (raw != b->last_raw)
+    {
+        b->last_raw = raw;
+        b->last_change = t;
+    }
+
+    if ((t - b->last_change) >= DEBOUNCE_MS)
+    {
+        if (b->stable != raw)
+        {
+            b->stable = raw;
+
+            if (b->stable == 1)
+            {
+                b->fired = 0;
+            }
+        }
+    }
+
+    // Active-low button: event fires when stable becomes 0
+    if (b->stable == 0 && b->fired == 0)
+    {
+        b->fired = 1;
+        return 1;
+    }
+
+    return 0;
+}
+
+// Read all physical buttons
+static void read_buttons(uint8_t *s, uint8_t *p, uint8_t *r, uint8_t *m)
+{
+    uint8_t pa = PORTA;
+
+    *s = btn_edge(&g_b_start, (pa & BTN_START_MASK) ? 1 : 0);
+    *p = btn_edge(&g_b_pause, (pa & BTN_PAUSE_MASK) ? 1 : 0);
+    *r = btn_edge(&g_b_reset, (pa & BTN_RESET_MASK) ? 1 : 0);
+    *m = btn_edge(&g_b_mode,  (pa & BTN_MODE_MASK)  ? 1 : 0);
+}
+
+/* ===================== KEYPAD ===================== */
+
+// Scan keypad rows and columns and return pressed key
+static char keypad_sample(uint8_t *out_row, uint8_t *out_col)
+{
+    uint8_t r;
+    uint8_t c;
+
+    for (r = 0; r < 4; r++)
+    {
+        uint8_t mask = (uint8_t)(0x0F & ~(uint8_t)(1u << r));
+        uint8_t col_in;
+
+        portb_write(mask);      // Drive one row low
+        __delay_us(80);
+
+        col_in = (uint8_t)((PORTB >> 4) & 0x07);   // Read 3 columns
+
+        if (col_in != 0x07)
+        {
+            for (c = 0; c < 3; c++)
+            {
+                if (!(col_in & (1u << c)))
+                {
+                    *out_row = r;
+                    *out_col = c;
+
+                    rows_idle_high();
+
+                    return keymap[r][c];
+                }
+            }
+        }
+    }
+
+    rows_idle_high();
+
+    return 0;
+}
+
+// Keypad state machine tick
+static void keypad_tick(void)
+{
+    uint8_t r = 0;
+    uint8_t c = 0;
+    char key = keypad_sample(&r, &c);
+    uint32_t t = now_ms();
+
+    switch (g_ksm)
+    {
+    case KSM_IDLE:
+        if (key)
+        {
+            g_ksm = KSM_DEBOUNCE;
+            g_ksm_row = r;
+            g_ksm_col = c;
+            g_ksm_start_ms = t;
+        }
+        break;
+
+    case KSM_DEBOUNCE:
+        if (key && r == g_ksm_row && c == g_ksm_col)
+        {
+            if ((t - g_ksm_start_ms) >= 20)
+            {
+                g_ksm = KSM_HELD;
+            }
+        }
+        else
+        {
+            g_ksm = KSM_IDLE;
+        }
+        break;
+
+    case KSM_HELD:
+    {
+        char k = keymap[g_ksm_row][g_ksm_col];
+        uint32_t held;
+
+        // Normal key press is accepted on release
+        if (!key || r != g_ksm_row || c != g_ksm_col)
+        {
+            g_pending_key = k;
+            g_pending_long = 0;
+            g_ksm = KSM_IDLE;
+            break;
+        }
+
+        held = t - g_ksm_start_ms;
+
+        // Long press '*' toggles child lock
+        if (k == '*' && held >= LONGPRESS_LOCK_MS)
+        {
+            g_pending_key = '*';
+            g_pending_long = 1;
+            g_ksm = KSM_RELEASE_WAIT;
+        }
+        // Long press '#' switches temperature screen
+        else if (k == '#' && held >= LONGPRESS_SCREEN_MS)
+        {
+            g_pending_key = '#';
+            g_pending_long = 2;
+            g_ksm = KSM_RELEASE_WAIT;
+        }
+
+        break;
+    }
+
+    case KSM_RELEASE_WAIT:
+        if (!key)
+        {
+            g_ksm = KSM_IDLE;
+        }
+        break;
+
+    default:
+        g_ksm = KSM_IDLE;
+        break;
+    }
+}
+
+// Get pending keypad key event
+static char key_pop(uint8_t *out_long)
+{
+    char k = g_pending_key;
+
+    if (k)
+    {
+        *out_long = g_pending_long;
+
+        g_pending_key = 0;
+        g_pending_long = 0;
+    }
+
+    return k;
+}
+
+/* ===================== FLASH ===================== */
+
+// Show temporary message on LCD
+static void flash_show(const char *l1, const char *l2, uint16_t ms)
+{
+    g_flash_until = now_ms() + (uint32_t)ms;
+
+    lcd_clear();
+
+    lcd_goto(0, 0);
+    lcd_print(l1);
+
+    lcd_goto(1, 0);
+    lcd_print(l2);
+}
+
+// Check if flash message is still active
+static uint8_t flash_active(void)
+{
+    if (g_flash_until == 0)
+    {
+        return 0;
+    }
+
+    if (now_ms() >= g_flash_until)
+    {
+        g_flash_until = 0;
+        lcd_clear();
+
+        return 0;
+    }
+
+    return 1;
+}
+
+// Cancel any active flash message
+static void flash_cancel(void)
+{
+    if (g_flash_until)
+    {
+        g_flash_until = 0;
+        lcd_clear();
+    }
+}
+
+/* ===================== SCREEN ===================== */
+
+// Convert seconds to MM:SS string
+static void fmt_mmss(uint16_t s, char *o)
+{
+    uint16_t mm = s / 60;
+    uint16_t ss = s % 60;
+
+    if (mm > 99)
+    {
+        mm = 99;
+    }
+
+    o[0] = (uint8_t)(mm / 10) + '0';
+    o[1] = (uint8_t)(mm % 10) + '0';
+    o[2] = ':';
+    o[3] = (uint8_t)(ss / 10) + '0';
+    o[4] = (uint8_t)(ss % 10) + '0';
+    o[5] = '\0';
+}
+
+// Return text label for current state
+static const char *state_label(state_t s)
+{
+    switch (s)
+    {
+    case ST_SETTING:
+        return "SET    ";
+
+    case ST_RUNNING:
+        return "RUN    ";
+
+    case ST_PAUSED:
+        return "PAUSE  ";
+
+    case ST_FINISHED:
+        return "DONE   ";
+
+    default:
+        return "       ";
+    }
+}
+
+// Draw the current screen on LCD
+static void render_screen(void)
+{
+    char buf[6];
+
+    // Emergency screen has highest priority
+    if (g_state == ST_EMERGENCY)
+    {
+        if (g_reset_holding)
+        {
+            uint8_t gas_now = (PORTA & GAS_MASK) ? 1 : 0;
+            uint32_t held = now_ms() - g_reset_hold_start;
+            uint8_t bars;
+            uint8_t i;
+
+            if (held > RESET_HOLD_MS)
+            {
+                held = RESET_HOLD_MS;
+            }
+
+            bars = (uint8_t)((held * 14UL) / RESET_HOLD_MS);
+
+            lcd_goto(0, 0);
+
+            if (gas_now)
+            {
+                lcd_print("GAS HIGH-WAIT!  ");
+            }
+            else
+            {
+                lcd_print("RESETTING...    ");
+            }
+
+            lcd_goto(1, 0);
+            lcd_data('[');
+
+            for (i = 0; i < 14; i++)
+            {
+                lcd_data((i < bars) ? 0xFF : ' ');
+            }
+
+            lcd_data(']');
+
+            return;
+        }
+
+        lcd_goto(0, 0);
+        lcd_print("GAS DETECTED!   ");
+
+        lcd_goto(1, 0);
+        lcd_print("EMERGENCY STOP  ");
+
+        return;
+    }
+
+    // Normal screen rendering
+    switch (g_screen)
+    {
+    case SCR_MAIN:
+        fmt_mmss(remain_sec(), buf);
+
+        lcd_goto(0, 0);
+        lcd_print("TIME:    ");
+        lcd_print(buf);
+        lcd_print("  ");
+
+        lcd_goto(1, 0);
+        lcd_print("STATE:  ");
+        lcd_print(state_label(g_state));
+        lcd_print(" ");
+        break;
+
+    case SCR_TEMP:
+        lcd_goto(0, 0);
+
+        if (g_dht_ok)
+        {
+            lcd_print("TEMP:    ");
+            lcd_print_u8_2d(g_temp);
+            lcd_print(" C   ");
+        }
+        else
+        {
+            lcd_print("TEMP:    --- C  ");
+        }
+
+        lcd_goto(1, 0);
+
+        if (g_dht_ok)
+        {
+            lcd_print("HUMID:   ");
+            lcd_print_u8_2d(g_hum);
+            lcd_print(" %   ");
+        }
+        else
+        {
+            lcd_print("HUMID:   --- %  ");
+        }
+        break;
+
+    case SCR_SAFETY:
+    {
+        uint8_t gas = (PORTA & GAS_MASK) ? 1 : 0;
+
+        lcd_goto(0, 0);
+        lcd_print("GAS:     ");
+        lcd_print(gas ? "DETECT!" : "SAFE   ");
+
+        lcd_goto(1, 0);
+        lcd_print("ALARM:   ");
+        lcd_print(gas ? "ON     " : "OFF    ");
+        break;
+    }
+
+    case SCR_SYSTEM:
+        lcd_goto(0, 0);
+        lcd_print("LOCK:    ");
+        lcd_print(g_lock ? "ON     " : "OFF    ");
+
+        lcd_goto(1, 0);
+        lcd_print("SYSTEM:  READY  ");
+        break;
+
+    default:
+        break;
+    }
+}
+
+// Startup welcome animation
+static void welcome(void)
+{
+    uint8_t c;
+
+    for (c = 0; c <= 9; c++)
+    {
+        lcd_clear();
+
+        lcd_goto(0, c);
+        lcd_print("WELCOME");
+
+        __delay_ms(140);
+    }
+
+    __delay_ms(250);
+
+    lcd_clear();
+
+    lcd_goto(0, 0);
+    lcd_print("  SMART OVEN");
+
+    lcd_goto(1, 0);
+    lcd_print("  v2.0  READY");
+
+    __delay_ms(900);
+
+    lcd_clear();
+}
+
+/* ===================== BARGRAPH ===================== */
+
+// Turn ON first n bargraph segments
+static void bargraph_set(uint8_t n)
+{
+    if (n > 10)
+    {
+        n = 10;
+    }
+
+    BAR_SEG0 = (n > 0) ? 1 : 0;
+    BAR_SEG1 = (n > 1) ? 1 : 0;
+
+    if (n >= 2)
+    {
+        uint8_t k = (uint8_t)(n - 2);
+
+        if (k == 0)
+        {
+            PORTD = 0;
+        }
+        else
+        {
+            PORTD = (uint8_t)((1u << k) - 1u);
+        }
+    }
+    else
+    {
+        PORTD = 0;
+    }
+}
+
+// Turn ON only one bargraph segment
+static void bargraph_one(uint8_t pos)
+{
+    BAR_SEG0 = (pos == 0) ? 1 : 0;
+    BAR_SEG1 = (pos == 1) ? 1 : 0;
+
+    if (pos >= 2 && pos <= 9)
+    {
+        PORTD = (uint8_t)(1u << (pos - 2));
+    }
+    else
+    {
+        PORTD = 0;
+    }
+}
+
+// Update bargraph depending on system state
+static void bargraph_update(void)
+{
+    static uint32_t blink_ts = 0;
+    static uint8_t blink = 0;
+    static uint32_t scan_ts = 0;
+    static int8_t scan_pos = 0;
+    static int8_t scan_dir = 1;
+
+    uint32_t t = now_ms();
+
+    // Emergency: scanning bar animation
+    if (g_state == ST_EMERGENCY)
+    {
+        if ((t - scan_ts) >= 120UL)
+        {
+            scan_ts = t;
+            scan_pos = (int8_t)(scan_pos + scan_dir);
+
+            if (scan_pos >= 9)
+            {
+                scan_pos = 9;
+                scan_dir = -1;
+            }
+            else if (scan_pos <= 0)
+            {
+                scan_pos = 0;
+                scan_dir = 1;
+            }
+        }
+
+        bargraph_one((uint8_t)scan_pos);
+
+        return;
+    }
+
+    // Finished: blink full bargraph
+    if (g_state == ST_FINISHED)
+    {
+        if ((t - blink_ts) >= 500UL)
+        {
+            blink_ts = t;
+            blink ^= 1;
+        }
+
+        bargraph_set(blink ? 10 : 0);
+
+        return;
+    }
+
+    // If no total time, bargraph is off
+    if (g_total == 0)
+    {
+        bargraph_set(0);
+        return;
+    }
+
+    {
+        // Show remaining time percentage as 10 levels
+        uint32_t n = ((uint32_t)remain_sec() * 10UL) / (uint32_t)g_total;
+
+        if (n > 10)
+        {
+            n = 10;
+        }
+
+        bargraph_set((uint8_t)n);
+    }
+}
+
+/* ===================== LEDS ===================== */
+
+// Update green, yellow, and red status LEDs
+static void leds_update(void)
+{
+    static uint32_t cycle_ts = 0;
+    static uint8_t cycle = 0;
+    static uint32_t red_ts = 0;
+    static uint8_t red_on = 0;
+
+    uint32_t t = now_ms();
+
+    LED_GREEN = 0;
+    LED_YELLOW = 0;
+    LED_RED = 0;
+
+    // Emergency: red LED blinking
+    if (g_state == ST_EMERGENCY)
+    {
+        if ((t - red_ts) >= 350UL)
+        {
+            red_ts = t;
+            red_on ^= 1;
+        }
+
+        LED_RED = red_on;
+
+        return;
+    }
+
+    // Running: green LED ON
+    if (g_state == ST_RUNNING)
+    {
+        LED_GREEN = 1;
+        return;
+    }
+
+    // Paused: yellow LED ON
+    if (g_state == ST_PAUSED)
+    {
+        LED_YELLOW = 1;
+        return;
+    }
+
+    // Finished: LEDs cycle for 5 seconds, then yellow stays ON
+    if (g_state == ST_FINISHED)
+    {
+        if ((t - g_finish_ts) < 5000UL)
+        {
+            if ((t - cycle_ts) >= 500UL)
+            {
+                cycle_ts = t;
+                cycle = (uint8_t)((cycle + 1) % 3);
+            }
+
+            if (cycle == 0)
+            {
+                LED_GREEN = 1;
+            }
+
+            if (cycle == 1)
+            {
+                LED_RED = 1;
+            }
+
+            if (cycle == 2)
+            {
+                LED_YELLOW = 1;
+            }
+        }
+        else
+        {
+            LED_YELLOW = 1;
+        }
+    }
+}
+
+/* ===================== BUZZER ===================== */
+
+// Update buzzer pattern depending on system state
+static void buzzer_update(void)
+{
+    static uint32_t blink_ts = 0;
+    static uint8_t blink = 0;
+
+    uint32_t t = now_ms();
+
+    // Emergency alarm pattern
+    if (g_state == ST_EMERGENCY)
+    {
+        uint32_t e = (t - g_emerg_ts) % 1800UL;
+
+        if (e < 350UL)
+        {
+            buzzer(1);
+        }
+        else if (e < 550UL)
+        {
+            buzzer(0);
+        }
+        else if (e < 1250UL)
+        {
+            buzzer(1);
+        }
+        else
+        {
+            buzzer(0);
+        }
+
+        return;
+    }
+
+    // Finished buzzer: blink for 5 seconds, then stay ON
+    if (g_state == ST_FINISHED)
+    {
+        uint32_t e = t - g_finish_ts;
+
+        if (e < 5000UL)
+        {
+            if ((t - blink_ts) >= 500UL)
+            {
+                blink_ts = t;
+                blink ^= 1;
+            }
+
+            buzzer(blink);
+        }
+        else
+        {
+            buzzer(1);
+        }
+
+        return;
+    }
+
+    // Otherwise buzzer OFF
+    buzzer(0);
+}
+
+/* ===================== STATE ===================== */
+
+// Clear entered time and reset timer variables
+static void clear_entry(void)
+{
+    g_mm = 0;
+    g_ss = 0;
+    g_entry_pos = 0;
+
+    INTCONbits.GIE = 0;
+    g_remain = 0;
+    INTCONbits.GIE = 1;
+
+    g_total = 0;
+}
+
+// Return system to setting mode
+static void enter_setting(void)
+{
+    g_state = ST_SETTING;
+    g_screen = SCR_MAIN;
+
+    clear_entry();
+
+    g_finish_ts = 0;
+    g_emerg_ts = 0;
+    g_reset_holding = 0;
+    g_reset_hold_start = 0;
+
+    buzzer(0);
+    flash_cancel();
+
+    lcd_clear();
+    render_screen();
+}
+
+// Enter emergency mode when gas is detected
+static void enter_emergency(void)
+{
+    if (g_state != ST_EMERGENCY)
+    {
+        g_state = ST_EMERGENCY;
+        g_emerg_ts = now_ms();
+
+        g_reset_holding = 0;
+        g_reset_hold_start = 0;
+
+        buzzer(0);
+        flash_cancel();
+
+        lcd_clear();
+        render_screen();
+    }
+}
+
+// Handle numeric keypad input for MMSS time entry
+static void handle_digit(char k)
+{
+    uint8_t d;
+    uint16_t total;
+
+    if (g_state != ST_SETTING && g_state != ST_PAUSED)
+    {
+        return;
+    }
+
+    if (g_lock)
+    {
+        return;
+    }
+
+    d = (uint8_t)(k - '0');
+
+    // If four digits already entered, start a new entry
+    if (g_entry_pos >= 4)
+    {
+        clear_entry();
+    }
+
+    switch (g_entry_pos)
+    {
+    case 0:
+        g_mm = (uint8_t)(d * 10);
+        g_entry_pos = 1;
+        break;
+
+    case 1:
+        g_mm = (uint8_t)(g_mm + d);
+        g_entry_pos = 2;
+        break;
+
+    case 2:
+        // Seconds tens digit cannot be greater than 5
+        if (d > 5)
+        {
+            flash_show("INVALID ENTRY  ", "SS = 00..59    ", FLASH_MSG_MS_MEDIUM);
+            return;
+        }
+
+        g_ss = (uint8_t)(d * 10);
+        g_entry_pos = 3;
+        break;
+
+    case 3:
+        g_ss = (uint8_t)(g_ss + d);
+        g_entry_pos = 4;
+        break;
+
+    default:
+        break;
+    }
+
+    total = (uint16_t)((uint16_t)g_mm * 60u + (uint16_t)g_ss);
+
+    INTCONbits.GIE = 0;
+    g_remain = total;
+    INTCONbits.GIE = 1;
+
+    if (g_entry_pos == 4)
+    {
+        g_total = total;
+    }
+}
+
+/* ===================== MAIN ===================== */
+
+int main(void)
+{
+    uint32_t last_lcd_ms = 0;
+
+    // Make analog pins digital and disable comparators
+    ADCON1 = 0x07;
+    CMCON  = 0x07;
+
+    // Configure I/O directions
+    TRISA = 0xFF;          // PORTA inputs
+    TRISB = 0b01110000;    // RB4-RB6 inputs, others outputs
+    TRISC = 0x00;          // PORTC outputs
+    TRISD = 0x00;          // PORTD outputs
+    TRISE = 0x00;          // PORTE outputs
+
+    // Clear output ports
+    PORTC = 0x00;
+    PORTD = 0x00;
+    PORTE = 0x00;
+
+    g_buzz = 0;
+    rows_idle_high();
+
+    // Startup delay
+    __delay_ms(250);
+    __delay_ms(250);
+    __delay_ms(250);
+    __delay_ms(250);
+    __delay_ms(250);
+    __delay_ms(250);
+    __delay_ms(250);
+    __delay_ms(250);
+    __delay_ms(250);
+    __delay_ms(250);
+
+    // Initialize LCD and show welcome message
+    lcd_init();
+    welcome();
+
+    // Start Timer0 interrupt
+    timer0_init();
+
+    // First DHT22 read
+    (void)dht22_read();
+
+    // Initial state
+    g_state = ST_SETTING;
+    g_screen = SCR_MAIN;
+    g_lock = 0;
+
+    clear_entry();
+
+    lcd_clear();
+    render_screen();
+
+    // ===================== MAIN LOOP =====================
+    while (1)
+    {
+        uint32_t t = now_ms();
+        uint8_t gas = (PORTA & GAS_MASK) ? 1 : 0;
+
+        // If gas is detected, immediately enter emergency state
+        if (gas && g_state != ST_EMERGENCY)
+        {
+            enter_emergency();
+        }
+
+        // Scan keypad continuously
+        keypad_tick();
+
+        {
+            uint8_t evS = 0;
+            uint8_t evP = 0;
+            uint8_t evR = 0;
+            uint8_t evM = 0;
+
+            uint8_t klong = 0;
+            char kk;
+
+            // Read buttons and keypad event
+            read_buttons(&evS, &evP, &evR, &evM);
+
+            kk = key_pop(&klong);
+
+            // Emergency state has special reset behavior
+            if (g_state == ST_EMERGENCY)
+            {
+                uint8_t reset_down = (g_b_reset.stable == 0) ? 1 : 0;
+
+                if (reset_down)
+                {
+                    if (!g_reset_holding)
+                    {
+                        g_reset_holding = 1;
+                        g_reset_hold_start = t;
+
+                        lcd_clear();
+                        render_screen();
+                    }
+                    else if (gas)
+                    {
+                        // If gas is still high, restart reset hold timer
+                        g_reset_hold_start = t;
+                    }
+                    else if ((t - g_reset_hold_start) >= RESET_HOLD_MS)
+                    {
+                        // Reset only after holding reset long enough while gas is safe
+                        g_reset_holding = 0;
+                        enter_setting();
+                    }
+                }
+                else
+                {
+                    if (g_reset_holding)
+                    {
+                        g_reset_holding = 0;
+
+                        lcd_clear();
+                        render_screen();
+                    }
+                }
+
+                // Prevent unused variable warnings in emergency section
+                (void)evS;
+                (void)evP;
+                (void)evR;
+                (void)evM;
+                (void)kk;
+                (void)klong;
+            }
+            else
+            {
+                // Mode button switches between LCD screens
+                if (evM)
+                {
+                    g_screen = (screen_t)((uint8_t)g_screen + 1);
+
+                    if (g_screen >= SCR_COUNT)
+                    {
+                        g_screen = SCR_MAIN;
+                    }
+
+                    flash_cancel();
+
+                    if (g_screen == SCR_TEMP)
+                    {
+                        dht22_read_retry();
+                        g_dht_last = t;
+                    }
+
+                    lcd_clear();
+                    render_screen();
+                }
+
+                // Buttons work only if child lock is OFF
+                if (!g_lock)
+                {
+                    // Reset returns to setting state
+                    if (evR)
+                    {
+                        enter_setting();
+                    }
+
+                    // Start countdown if time is entered
+                    if (evS && remain_sec() > 0 && g_state == ST_SETTING)
+                    {
+                        g_state = ST_RUNNING;
+
+                        INTCONbits.GIE = 0;
+                        g_subsec = 0;
+                        INTCONbits.GIE = 1;
+
+                        flash_cancel();
+
+                        lcd_clear();
+                        render_screen();
+                    }
+
+                    // Pause or resume countdown
+                    if (evP)
+                    {
+                        if (g_state == ST_RUNNING)
+                        {
+                            g_state = ST_PAUSED;
+
+                            flash_cancel();
+
+                            lcd_clear();
+                            render_screen();
+                        }
+                        else if (g_state == ST_PAUSED)
+                        {
+                            g_state = ST_RUNNING;
+
+                            flash_cancel();
+
+                            lcd_clear();
+                            render_screen();
+                        }
+                    }
+                }
+
+                // Handle keypad events
+                if (kk)
+                {
+                    // Long press '*' toggles child lock
+                    if (kk == '*' && klong == 1)
+                    {
+                        if (g_state == ST_SETTING || g_state == ST_PAUSED)
+                        {
+                            g_lock ^= 1;
+
+                            flash_show("CHILD LOCK     ",
+                                       g_lock ? "LOCKED         " : "UNLOCKED       ",
+                                       FLASH_MSG_MS_MEDIUM);
+                        }
+                        else
+                        {
+                            flash_show("LOCK UNAVAILABLE",
+                                       "SET or PAUSE    ",
+                                       FLASH_MSG_MS_MEDIUM);
+                        }
+                    }
+                    // Long press '#' toggles temperature screen
+                    else if (kk == '#' && klong == 2)
+                    {
+                        if (g_screen == SCR_TEMP)
+                        {
+                            g_screen = SCR_MAIN;
+                        }
+                        else
+                        {
+                            g_screen = SCR_TEMP;
+                            dht22_read_retry();
+                            g_dht_last = t;
+                        }
+
+                        flash_cancel();
+
+                        lcd_clear();
+                        render_screen();
+                    }
+                    // Normal numeric key enters timer digits
+                    else if (kk >= '0' && kk <= '9' && klong == 0)
+                    {
+                        handle_digit(kk);
+
+                        if (!flash_active())
+                        {
+                            render_screen();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Periodically refresh DHT22 data on temperature screen
+        if (g_screen == SCR_TEMP && g_state != ST_EMERGENCY)
+        {
+            if ((t - g_dht_last) >= DHT_REFRESH_MS)
+            {
+                dht22_read();
+                g_dht_last = t;
+
+                if (!flash_active())
+                {
+                    render_screen();
+                }
+            }
+        }
+
+        // Refresh LCD regularly if no flash message is active
+        if (!flash_active() && (t - last_lcd_ms) >= LCD_REFRESH_MS)
+        {
+            last_lcd_ms = t;
+            render_screen();
+        }
+
+        // Update outputs continuously
+        bargraph_update();
+        leds_update();
+        buzzer_update();
+    }
+
+    return 0;
+}
